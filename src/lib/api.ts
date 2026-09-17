@@ -46,7 +46,7 @@ export interface VideoResolve {
   videoUrl?: string;
   hlsUrl?: string;
   qualities?: { quality: string; url: string }[];
-  embedUrl?: string;
+  embedUrl?: string | null;
   error?: string;
 }
 

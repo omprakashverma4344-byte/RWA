@@ -108,6 +108,7 @@ model MediaResolve {
   videoUrl  String?
   hlsUrl    String?
   qualities String? // JSON [{quality, url}]
+  embedUrl  String? // embed_url or YouTube watch url when no direct stream
   pdfUrl    String?
   updatedAt DateTime  @updatedAt
 }

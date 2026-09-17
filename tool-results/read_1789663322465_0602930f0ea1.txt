@@ -1,0 +1,1003 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * Golden Theater — Study Bison's premium lecture player.
+     5→ *
+     6→ * SOURCE mode (default): embeds the original rwaweb.vercel.app topic page in a
+     7→ *   golden-framed stage. Playback runs on the origin's own secure stream, so
+     8→ *   fresh links are resolved by the source itself at play time — lectures keep
+     9→ *   working even when the upstream rate-limits our direct resolver.
+    10→ *
+    11→ * NATIVE mode: Study Bison's own golden video player (direct mp4 / HLS with
+    12→ *   adaptive-quality fallback) for when a fresh direct stream is available.
+    13→ */
+    14→
+    15→import { useCallback, useEffect, useRef, useState } from "react";
+    16→import { api, type ApiContent, type VideoResolve } from "@/lib/api";
+    17→import { attachSource, buildSourceCandidates, type SourceCandidate } from "@/lib/hls";
+    18→import { useStore } from "@/lib/store";
+    19→import {
+    20→  X,
+    21→  Play,
+    22→  Pause,
+    23→  RotateCcw,
+    24→  RotateCw,
+    25→  Volume2,
+    26→  VolumeX,
+    27→  Maximize,
+    28→  Minimize,
+    29→  Settings,
+    30→  PictureInPicture2,
+    31→  Loader2,
+    32→  PlayCircle,
+    33→  SkipBack,
+    34→  SkipForward,
+    35→  RefreshCw,
+    36→  MonitorPlay,
+    37→  Film,
+    38→  ExternalLink,
+    39→  RectangleHorizontal,
+    40→  HelpCircle,
+    41→  LogIn,
+    42→  MousePointerClick,
+    43→  ListVideo,
+    44→  BellOff,
+    45→} from "lucide-react";
+    46→import { cn } from "@/lib/utils";
+    47→
+    48→const GUIDE_KEY = "sb_theater_guide_v1";
+    49→const SOURCE_ORIGIN = "https://rwaweb.vercel.app";
+    50→
+    51→function fmt(t: number): string {
+    52→  if (!Number.isFinite(t)) return "0:00";
+    53→  const h = Math.floor(t / 3600);
+    54→  const m = Math.floor((t % 3600) / 60);
+    55→  const s = Math.floor(t % 60);
+    56→  return h > 0
+    57→    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    58→    : `${m}:${String(s).padStart(2, "0")}`;
+    59→}
+    60→
+    61→const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+    62→
+    63→export function VideoPlayerModal({
+    64→  content,
+    65→  onClose,
+    66→}: {
+    67→  content: ApiContent;
+    68→  onClose: () => void;
+    69→}) {
+    70→  // ============ shared state ============
+    71→  const mode = useStore((s) => s.playerMode);
+    72→  const setMode = useStore((s) => s.setPlayerMode);
+    73→  const cinema = useStore((s) => s.playerCinema);
+    74→  const setCinema = useStore((s) => s.setPlayerCinema);
+    75→  const [fullscreen, setFullscreen] = useState(false);
+    76→  const [guideOpen, setGuideOpen] = useState(false);
+    77→  const playlist = useStore((s) => s.playerPlaylist);
+    78→  const playNext = useStore((s) => s.playNextLecture);
+    79→  const playPrev = useStore((s) => s.playPrevLecture);
+    80→
+    81→  const pIdx = playlist.findIndex((p) => p.id === content.id);
+    82→  const hasPrev = pIdx > 0;
+    83→  const hasNext = pIdx >= 0 && pIdx < playlist.length - 1;
+    84→
+    85→  const shellRef = useRef<HTMLDivElement>(null);
+    86→
+    87→  // guide: show once per browser until dismissed
+    88→  useEffect(() => {
+    89→    try {
+    90→      if (window.localStorage.getItem(GUIDE_KEY) !== "1") setGuideOpen(true);
+    91→    } catch {
+    92→      setGuideOpen(true);
+    93→    }
+    94→  }, []);
+    95→
+    96→  const dismissGuide = () => {
+    97→    setGuideOpen(false);
+    98→    try {
+    99→      window.localStorage.setItem(GUIDE_KEY, "1");
+   100→    } catch {
+   101→      /* private mode */
+   102→    }
+   103→  };
+   104→
+   105→  // ============ fullscreen ============
+   106→  const toggleFullscreen = useCallback(() => {
+   107→    if (!document.fullscreenElement) {
+   108→      shellRef.current?.requestFullscreen?.().catch(() => undefined);
+   109→    } else {
+   110→      document.exitFullscreen?.().catch(() => undefined);
+   111→    }
+   112→  }, []);
+   113→
+   114→  useEffect(() => {
+   115→    const onFs = () => setFullscreen(Boolean(document.fullscreenElement));
+   116→    document.addEventListener("fullscreenchange", onFs);
+   117→    return () => document.removeEventListener("fullscreenchange", onFs);
+   118→  }, []);
+   119→
+   120→  // ============ SOURCE (iframe) state ============
+   121→  const [iframeKey, setIframeKey] = useState(0);
+   122→  const [iframeLoading, setIframeLoading] = useState(true);
+   123→
+   124→  useEffect(() => {
+   125→    setIframeLoading(true);
+   126→  }, [iframeKey, mode]);
+   127→
+   128→  const sourceUrl = `${SOURCE_ORIGIN}/batch/${content.courseId}/subject/${content.subjectId}/topic/${content.topicId}`;
+   129→
+   130→  // ============ NATIVE pipeline (kept from v1, runs only in native mode) ============
+   131→  const videoRef = useRef<HTMLVideoElement>(null);
+   132→  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+   133→  const cleanupRef = useRef<() => void>(() => undefined);
+   134→  const candidateIdxRef = useRef(0);
+   135→  const resolveRoundRef = useRef(0);
+   136→  const [resolving, setResolving] = useState(false);
+   137→  const [resolveError, setResolveError] = useState<string | null>(null);
+   138→  const [srcError, setSrcError] = useState<string | null>(null);
+   139→  const [playing, setPlaying] = useState(false);
+   140→  const [current, setCurrent] = useState(0);
+   141→  const [duration, setDuration] = useState(0);
+   142→  const [buffered, setBuffered] = useState(0);
+   143→  const [volume, setVolume] = useState(1);
+   144→  const [muted, setMuted] = useState(false);
+   145→  const [speed, setSpeed] = useState(1);
+   146→  const [showControls, setShowControls] = useState(true);
+   147→  const [menu, setMenu] = useState<null | "settings">(null);
+   148→  const [candidates, setCandidates] = useState<SourceCandidate[]>([]);
+   149→  const [activeIdx, setActiveIdx] = useState(0);
+   150→  const [hasEmittedPlay, setHasEmittedPlay] = useState(false);
+   151→  const [attempts, setAttempts] = useState(0);
+   152→  const nativeStartedRef = useRef(false);
+   153→
+   154→  const playCandidateRef = useRef<(list: SourceCandidate[], idx: number) => void>(
+   155→    () => undefined
+   156→  );
+   157→  const resolveFreshRef = useRef<(round: number) => void>(() => undefined);
+   158→
+   159→  const resolveFresh = useCallback(
+   160→    (round: number) => {
+   161→      setResolving(true);
+   162→      setResolveError(null);
+   163→      setSrcError(null);
+   164→      setAttempts(round);
+   165→      const force = round > 0 ? "&force=1" : "";
+   166→      api
+   167→        .resolveVideo(content.courseId, content.contentId, force)
+   168→        .then((r: VideoResolve | null) => {
+   169→          const list = buildSourceCandidates(
+   170→            r
+   171→              ? {
+   172→                  videoUrl: r.videoUrl,
+   173→                  hlsUrl: r.hlsUrl,
+   174→                  qualities: r.qualities,
+   175→                  embedUrl: r.embedUrl ?? content.embedUrl,
+   176→                }
+   177→              : null
+   178→          );
+   179→          if (list.length === 0) {
+   180→            setResolving(false);
+   181→            if (round < 30) {
+   182→              setSrcError("busy"); // keep retrying
+   183→              setTimeout(() => resolveFreshRef.current(round + 1), 10000);
+   184→            } else {
+   185→              setSrcError("No playable stream found for this lecture.");
+   186→            }
+   187→            return;
+   188→          }
+   189→          setCandidates(list);
+   190→          setResolving(false);
+   191→        })
+   192→        .catch((e) => {
+   193→          const msg = String(e.message || e);
+   194→          if (msg.includes("busy") && round < 30) {
+   195→            setTimeout(() => resolveFreshRef.current(round + 1), 10000);
+   196→          } else {
+   197→            setResolveError(msg);
+   198→            setResolving(false);
+   199→          }
+   200→        });
+   201→    },
+   202→    [content.courseId, content.contentId, content.embedUrl]
+   203→  );
+   204→
+   205→  const playCandidate = (list: SourceCandidate[], idx: number) => {
+   206→    if (idx >= list.length) {
+   207→      if (resolveRoundRef.current < 3) {
+   208→        resolveRoundRef.current += 1;
+   209→        resolveFreshRef.current(resolveRoundRef.current);
+   210→      } else {
+   211→        setSrcError(
+   212→          "This lecture's direct stream links have expired and the servers are busy refreshing them. Switch back to the Source stream — it always plays."
+   213→        );
+   214→      }
+   215→      return;
+   216→    }
+   217→    const v = videoRef.current;
+   218→    if (!v) return;
+   219→    const c = list[idx];
+   220→    if (c.kind === "embed") {
+   221→      setSrcError("embed");
+   222→      return;
+   223→    }
+   224→    cleanupRef.current?.();
+   225→    candidateIdxRef.current = idx;
+   226→    setActiveIdx(idx);
+   227→    setSrcError(null);
+   228→    cleanupRef.current = attachSource(v, c.url, () => {
+   229→      playCandidateRef.current(list, idx + 1);
+   230→    });
+   231→    v.load();
+   232→    v.play().catch(() => undefined);
+   233→  };
+   234→
+   235→  useEffect(() => {
+   236→    playCandidateRef.current = playCandidate;
+   237→    resolveFreshRef.current = resolveFresh;
+   238→  });
+   239→
+   240→  // kick the native pipeline the first time the user switches to NATIVE mode
+   241→  useEffect(() => {
+   242→    if (mode !== "native") return;
+   243→    if (nativeStartedRef.current) return;
+   244→    nativeStartedRef.current = true;
+   245→    resolveRoundRef.current = 0;
+   246→    resolveFresh(0);
+   247→  }, [mode, resolveFresh]);
+   248→
+   249→  // (re)attach candidates once <video> mounts in native mode
+   250→  useEffect(() => {
+   251→    if (mode !== "native") return;
+   252→    if (!resolving && candidates.length > 0 && !srcError) {
+   253→      playCandidateRef.current(candidates, 0);
+   254→    }
+   255→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   256→  }, [candidates, resolving, mode]);
+   257→
+   258→  // cleanup native pipeline when leaving native mode or unmounting
+   259→  useEffect(() => {
+   260→    if (mode !== "native") {
+   261→      cleanupRef.current?.();
+   262→      cleanupRef.current = () => undefined;
+   263→    }
+   264→  }, [mode]);
+   265→
+   266→  useEffect(() => {
+   267→    return () => {
+   268→      cleanupRef.current?.();
+   269→    };
+   270→  }, []);
+   271→
+   272→  // keyboard shortcuts (parent-level; the iframe swallows keys when focused)
+   273→  useEffect(() => {
+   274→    const handler = (e: KeyboardEvent) => {
+   275→      if (e.key === "Escape" && !document.fullscreenElement) {
+   276→        onClose();
+   277→        return;
+   278→      }
+   279→      if (mode !== "native") return;
+   280→      const v = videoRef.current;
+   281→      if (!v) return;
+   282→      switch (e.key) {
+   283→        case " ":
+   284→        case "k":
+   285→          e.preventDefault();
+   286→          if (v.paused) v.play().catch(() => undefined);
+   287→          else v.pause();
+   288→          break;
+   289→        case "ArrowRight":
+   290→          v.currentTime = Math.min(v.currentTime + 10, v.duration || 0);
+   291→          break;
+   292→        case "ArrowLeft":
+   293→          v.currentTime = Math.max(v.currentTime - 10, 0);
+   294→          break;
+   295→        case "ArrowUp":
+   296→          e.preventDefault();
+   297→          v.volume = Math.min(v.volume + 0.1, 1);
+   298→          break;
+   299→        case "ArrowDown":
+   300→          e.preventDefault();
+   301→          v.volume = Math.max(v.volume - 0.1, 0);
+   302→          break;
+   303→        case "m":
+   304→          v.muted = !v.muted;
+   305→          break;
+   306→        case "f":
+   307→          toggleFullscreen();
+   308→          break;
+   309→      }
+   310→    };
+   311→    window.addEventListener("keydown", handler);
+   312→    return () => window.removeEventListener("keydown", handler);
+   313→  }, [onClose, mode, toggleFullscreen]);
+   314→
+   315→  const nudgeControls = useCallback(() => {
+   316→    setShowControls(true);
+   317→    if (hideTimer.current) clearTimeout(hideTimer.current);
+   318→    hideTimer.current = setTimeout(() => {
+   319→      if (videoRef.current && !videoRef.current.paused) setShowControls(false);
+   320→    }, 2800);
+   321→  }, []);
+   322→
+   323→  const mp4Qualities = candidates.filter((c) => c.kind === "mp4");
+   324→  const activeLabel = candidates[activeIdx]?.label ?? "Auto";
+   325→
+   326→  const pickQuality = (c: SourceCandidate | null) => {
+   327→    setMenu(null);
+   328→    const v = videoRef.current;
+   329→    if (!v) return;
+   330→    const time = v.currentTime;
+   331→    const wasPlaying = !v.paused || hasEmittedPlay;
+   332→    if (c) {
+   333→      playCandidate(candidates, candidates.indexOf(c));
+   334→    } else {
+   335→      playCandidate(candidates, 0);
+   336→    }
+   337→    if (wasPlaying) {
+   338→      v.addEventListener(
+   339→        "loadedmetadata",
+   340→        () => {
+   341→          v.currentTime = time;
+   342→        },
+   343→        { once: true }
+   344→      );
+   345→    }
+   346→  };
+   347→
+   348→  const isBusy = srcError === "busy";
+   349→
+   350→  // ============ tiny reusable golden icon button ============
+   351→  const GoldIcon = ({
+   352→    icon: Icon,
+   353→    label,
+   354→    onClick,
+   355→    disabled,
+   356→    active,
+   357→  }: {
+   358→    icon: React.ComponentType<{ className?: string }>;
+   359→    label: string;
+   360→    onClick?: () => void;
+   361→    disabled?: boolean;
+   362→    active?: boolean;
+   363→  }) => (
+   364→    <button
+   365→      onClick={onClick}
+   366→      disabled={disabled}
+   367→      aria-label={label}
+   368→      title={label}
+   369→      className={cn(
+   370→        "group/ib relative h-10 w-10 rounded-xl flex items-center justify-center transition-all duration-200",
+   371→        "border border-[rgba(230,194,110,0.22)] bg-white/5 backdrop-blur-md",
+   372→        "hover:bg-[rgba(230,194,110,0.16)] hover:border-[rgba(230,194,110,0.55)] hover:shadow-[0_0_18px_rgba(230,194,110,0.25)]",
+   373→        "disabled:opacity-30 disabled:pointer-events-none",
+   374→        active && "bg-[rgba(230,194,110,0.22)] border-[rgba(230,194,110,0.65)] text-[#f2d98a]"
+   375→      )}
+   376→    >
+   377→      <Icon className={cn("h-[18px] w-[18px] transition-colors", active ? "text-[#f2d98a]" : "text-[#e6c26e] group-hover/ib:text-[#f2d98a]")} />
+   378→    </button>
+   379→  );
+   380→
+   381→  return (
+   382→    <div className="fixed inset-0 z-[80] bg-black/97 backdrop-blur-md flex flex-col theater-root">
+   383→      {/* ================= header ================= */}
+   384→      <div className="shrink-0 relative z-20 border-b border-[rgba(230,194,110,0.18)] bg-gradient-to-r from-black/80 via-[#141005]/80 to-black/80">
+   385→        <div className="flex items-center gap-3 px-3 sm:px-4 h-14">
+   386→          <div className="h-9 w-9 rounded-xl btn-gold flex items-center justify-center shrink-0 shadow-[0_0_18px_rgba(230,194,110,0.35)]">
+   387→            <Film className="h-5 w-5 text-[#241a04]" />
+   388→          </div>
+   389→          <div className="min-w-0 flex-1">
+   390→            <p className="text-sm font-bold text-white truncate leading-tight">
+   391→              {content.title}
+   392→            </p>
+   393→            <p className="text-[11px] text-[#e6c26e]/70 leading-tight flex items-center gap-1.5">
+   394→              <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#e6c26e] animate-pulse" />
+   395→              Golden Theater · Lecture {pIdx >= 0 ? pIdx + 1 : 1}
+   396→              {playlist.length > 1 ? ` of ${playlist.length}` : ""}
+   397→            </p>
+   398→          </div>
+   399→
+   400→          {/* mode badge */}
+   401→          <div
+   402→            className={cn(
+   403→              "hidden sm:flex items-center gap-1.5 h-8 px-3 rounded-full text-[10px] font-extrabold tracking-[0.14em] uppercase",
+   404→              mode === "source"
+   405→                ? "bg-[rgba(230,194,110,0.14)] text-[#f2d98a] border border-[rgba(230,194,110,0.4)]"
+   406→                : "bg-white/5 text-white/70 border border-white/15"
+   407→            )}
+   408→          >
+   409→            {mode === "source" ? (
+   410→              <>
+   411→                <span className="h-1.5 w-1.5 rounded-full bg-[#e6c26e] animate-pulse" />
+   412→                Source stream
+   413→              </>
+   414→            ) : (
+   415→              <>
+   416→                <MonitorPlay className="h-3.5 w-3.5" />
+   417→                Native player
+   418→              </>
+   419→            )}
+   420→          </div>
+   421→
+   422→          <button
+   423→            onClick={() => setGuideOpen(true)}
+   424→            aria-label="How to use the source stream"
+   425→            title="How to use"
+   426→            className="h-9 w-9 rounded-xl flex items-center justify-center text-[#e6c26e] border border-[rgba(230,194,110,0.22)] bg-white/5 hover:bg-[rgba(230,194,110,0.16)] transition-colors"
+   427→          >
+   428→            <HelpCircle className="h-[18px] w-[18px]" />
+   429→          </button>
+   430→          <button
+   431→            onClick={() => {
+   432→              if (document.fullscreenElement) {
+   433→                document.exitFullscreen?.().catch(() => undefined);
+   434→              }
+   435→              onClose();
+   436→            }}
+   437→            aria-label="Close player"
+   438→            className="h-9 w-9 rounded-xl flex items-center justify-center text-white/80 hover:text-white border border-white/15 bg-white/5 hover:bg-white/15 transition-colors"
+   439→          >
+   440→            <X className="h-[18px] w-[18px]" />
+   441→          </button>
+   442→        </div>
+   443→        {/* golden hairline glow under header */}
+   444→        <div className="absolute bottom-0 inset-x-0 h-px bg-gradient-to-r from-transparent via-[rgba(230,194,110,0.65)] to-transparent" />
+   445→      </div>
+   446→
+   447→      {/* ================= stage ================= */}
+   448→      <div
+   449→        ref={shellRef}
+   450→        className="flex-1 relative flex items-center justify-center overflow-hidden bg-black min-h-0"
+   451→        onMouseMove={mode === "native" ? nudgeControls : undefined}
+   452→        onTouchStart={mode === "native" ? nudgeControls : undefined}
+   453→      >
+   454→        {/* golden ambient glow */}
+   455→        <div className="pointer-events-none absolute inset-0 opacity-70">
+   456→          <div className="absolute -top-24 left-1/4 h-72 w-72 rounded-full bg-[rgba(230,194,110,0.10)] blur-3xl" />
+   457→          <div className="absolute -bottom-24 right-1/5 h-72 w-72 rounded-full bg-[rgba(184,134,11,0.09)] blur-3xl" />
+   458→        </div>
+   459→
+   460→        {/* ---------- SOURCE MODE ---------- */}
+   461→        {mode === "source" ? (
+   462→          <div
+   463→            className={cn(
+   464→              "relative",
+   465→              cinema
+   466→                ? "w-full max-w-[1500px] aspect-video rounded-2xl overflow-hidden gold-border-glow"
+   467→                : "w-full h-full"
+   468→            )}
+   469→          >
+   470→            <iframe
+   471→              key={iframeKey}
+   472→              src={sourceUrl}
+   473→              title={`Lecture stream: ${content.title}`}
+   474→              className="absolute inset-0 w-full h-full border-0 bg-black"
+   475→              allow="autoplay; fullscreen; encrypted-media; picture-in-picture; clipboard-write"
+   476→              allowFullScreen
+   477→              onLoad={() => setIframeLoading(false)}
+   478→            />
+   479→
+   480→            {/* connecting shimmer */}
+   481→            {iframeLoading ? (
+   482→              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black">
+   483→                <div className="relative">
+   484→                  <div className="absolute -inset-6 rounded-full bg-[rgba(230,194,110,0.14)] blur-2xl" />
+   485→                  <Loader2 className="relative h-12 w-12 text-[#e6c26e] animate-spin" />
+   486→                </div>
+   487→                <p className="text-sm font-semibold gold-text tracking-wide">
+   488→                  Connecting to the source stream…
+   489→                </p>
+   490→                <p className="text-xs text-white/40">
+   491→                  Secure lecture link is being prepared
+   492→                </p>
+   493→              </div>
+   494→            ) : null}
+   495→
+   496→            {/* first-run golden guide */}
+   497→            {guideOpen ? (
+   498→              <div className="absolute inset-0 z-20 flex items-center justify-center p-4 bg-black/72 backdrop-blur-[6px]">
+   499→                <div className="glass glass-sheen gold-border-glow rounded-3xl max-w-md w-full p-6 relative overflow-hidden">
+   500→                  <div className="flex items-center gap-3 mb-4">
+   501→                    <div className="h-10 w-10 rounded-xl btn-gold flex items-center justify-center shrink-0">
+   502→                      <Film className="h-5 w-5 text-[#241a04]" />
+   503→                    </div>
+   504→                    <div>
+   505→                      <p className="font-extrabold gold-text leading-tight">
+   506→                        Golden Theater · Source Stream
+   507→                      </p>
+   508→                      <p className="text-[11px] text-white/50">
+   509→                        Lectures play on the original secure stream
+   510→                      </p>
+   511→                    </div>
+   512→                  </div>
+   513→
+   514→                  <ol className="space-y-3 text-sm text-white/85">
+   515→                    <li className="flex items-start gap-3">
+   516→                      <span className="h-6 w-6 shrink-0 rounded-lg btn-gold text-xs font-extrabold flex items-center justify-center">1</span>
+   517→                      <p className="flex items-center gap-2 flex-wrap">
+   518→                        <LogIn className="h-4 w-4 text-[#e6c26e] shrink-0" />
+   519→                        Tap <b className="text-[#f2d98a]">“Skip Login (Guest Mode)”</b> inside the frame — first time only.
+   520→                      </p>
+   521→                    </li>
+   522→                    <li className="flex items-start gap-3">
+   523→                      <span className="h-6 w-6 shrink-0 rounded-lg btn-gold text-xs font-extrabold flex items-center justify-center">2</span>
+   524→                      <p className="flex items-center gap-2 flex-wrap">
+   525→                        <BellOff className="h-4 w-4 text-[#e6c26e] shrink-0" />
+   526→                        If a channel popup appears, tap <b className="text-[#f2d98a]">“Maybe later”</b>.
+   527→                      </p>
+   528→                    </li>
+   529→                    <li className="flex items-start gap-3">
+   530→                      <span className="h-6 w-6 shrink-0 rounded-lg btn-gold text-xs font-extrabold flex items-center justify-center">3</span>
+   531→                      <p className="flex items-center gap-2 flex-wrap">
+   532→                        <RefreshCw className="h-4 w-4 text-[#e6c26e] shrink-0" />
+   533→                        Tap the gold <b className="text-[#f2d98a]">↻ Reload</b> button (bottom bar) to return to this lecture.
+   534→                      </p>
+   535→                    </li>
+   536→                    <li className="flex items-start gap-3">
+   537→                      <span className="h-6 w-6 shrink-0 rounded-lg btn-gold text-xs font-extrabold flex items-center justify-center">4</span>
+   538→                      <p className="flex items-center gap-2 flex-wrap">
+   539→                        <MousePointerClick className="h-4 w-4 text-[#e6c26e] shrink-0" />
+   540→                        Tap <b className="text-[#f2d98a]">{content.title.length > 42 ? "your lecture" : content.title}</b>{" "}
+   541→                        <PlayCircle className="h-4 w-4 text-[#e6c26e]" /> in the Videos list — it streams instantly.
+   542→                      </p>
+   543→                    </li>
+   544→                  </ol>
+   545→
+   546→                  <p className="mt-4 text-[11px] leading-relaxed text-white/45 flex items-start gap-2">
+   547→                    <ListVideo className="h-4 w-4 text-[#e6c26e]/70 shrink-0 mt-px" />
+   548→                    Stream links refresh automatically at play time, so lectures keep working even when direct servers are busy.
+   549→                  </p>
+   550→
+   551→                  <div className="mt-5 flex items-center gap-2">
+   552→                    <button
+   553→                      onClick={dismissGuide}
+   554→                      className="btn-gold rounded-xl px-4 py-2.5 text-sm font-extrabold flex-1"
+   555→                    >
+   556→                      Got it — let&apos;s watch
+   557→                    </button>
+   558→                  </div>
+   559→                </div>
+   560→              </div>
+   561→            ) : null}
+   562→          </div>
+   563→        ) : (
+   564→          /* ---------- NATIVE MODE ---------- */
+   565→          <>
+   566→            {resolving || isBusy ? (
+   567→              <div className="flex flex-col items-center gap-4 px-6 text-center">
+   568→                <Loader2 className="h-10 w-10 text-[#e6c26e] animate-spin" />
+   569→                <p className="text-sm text-white/70">
+   570→                  {isBusy
+   571→                    ? `Servers are busy, retrying…${attempts > 0 ? ` (attempt ${attempts + 1})` : ""}`
+   572→                    : "Preparing your lecture…"}
+   573→                </p>
+   574→                <button
+   575→                  onClick={() => setMode("source")}
+   576→                  className="text-xs text-[#e6c26e] underline underline-offset-4 hover:text-[#f2d98a]"
+   577→                >
+   578→                  Play via Source stream instead — always works
+   579→                </button>
+   580→              </div>
+   581→            ) : resolveError ? (
+   582→              <div className="text-center px-6">
+   583→                <p className="text-red-300 text-sm mb-3">
+   584→                  Could not load this lecture: {resolveError}
+   585→                </p>
+   586→                <div className="flex items-center justify-center gap-2">
+   587→                  <button
+   588→                    onClick={() => {
+   589→                      resolveRoundRef.current = 0;
+   590→                      resolveFresh(0);
+   591→                    }}
+   592→                    className="btn-gold rounded-xl px-4 py-2 text-sm font-bold"
+   593→                  >
+   594→                    Retry
+   595→                  </button>
+   596→                  <button
+   597→                    onClick={() => setMode("source")}
+   598→                    className="rounded-xl px-4 py-2 text-sm font-bold border border-[rgba(230,194,110,0.4)] text-[#e6c26e] hover:bg-[rgba(230,194,110,0.12)]"
+   599→                  >
+   600→                    Use Source stream
+   601→                  </button>
+   602→                </div>
+   603→              </div>
+   604→            ) : srcError && srcError !== "embed" && srcError !== "busy" ? (
+   605→              <div className="text-center px-6 max-w-md">
+   606→                <p className="text-white/80 text-sm mb-4">{srcError}</p>
+   607→                <div className="flex items-center justify-center gap-2">
+   608→                  <button
+   609→                    onClick={() => {
+   610→                      resolveRoundRef.current = 0;
+   611→                      resolveFresh(0);
+   612→                    }}
+   613→                    className="btn-gold rounded-xl px-4 py-2 text-sm font-bold"
+   614→                  >
+   615→                    Try again
+   616→                  </button>
+   617→                  <button
+   618→                    onClick={() => setMode("source")}
+   619→                    className="rounded-xl px-4 py-2 text-sm font-bold border border-[rgba(230,194,110,0.4)] text-[#e6c26e] hover:bg-[rgba(230,194,110,0.12)]"
+   620→                  >
+   621→                    Use Source stream
+   622→                  </button>
+   623→                </div>
+   624→              </div>
+   625→            ) : srcError === "embed" && content.embedUrl ? (
+   626→              <iframe
+   627→                src={content.embedUrl}
+   628→                title={content.title}
+   629→                className="w-full h-full border-0"
+   630→                allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+   631→                allowFullScreen
+   632→              />
+   633→            ) : (
+   634→              <video
+   635→                ref={videoRef}
+   636→                poster={content.thumbnail ?? undefined}
+   637→                controls={false}
+   638→                playsInline
+   639→                preload="auto"
+   640→                className={cn(
+   641→                  "w-full outline-none",
+   642→                  fullscreen ? "h-full object-contain" : "max-h-full"
+   643→                )}
+   644→                onClick={() => {
+   645→                  const v = videoRef.current;
+   646→                  if (v) {
+   647→                    if (v.paused) v.play().catch(() => undefined);
+   648→                    else v.pause();
+   649→                  }
+   650→                  nudgeControls();
+   651→                }}
+   652→                onPlay={() => {
+   653→                  setPlaying(true);
+   654→                  setHasEmittedPlay(true);
+   655→                  nudgeControls();
+   656→                }}
+   657→                onPause={() => {
+   658→                  setPlaying(false);
+   659→                  setShowControls(true);
+   660→                }}
+   661→                onWaiting={() => nudgeControls()}
+   662→                onTimeUpdate={(e) => {
+   663→                  const v = e.currentTarget;
+   664→                  setCurrent(v.currentTime);
+   665→                  if (v.buffered.length > 0)
+   666→                    setBuffered(v.buffered.end(v.buffered.length - 1));
+   667→                }}
+   668→                onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+   669→                onVolumeChange={(e) => {
+   670→                  setVolume(e.currentTarget.volume);
+   671→                  setMuted(e.currentTarget.muted);
+   672→                }}
+   673→              />
+   674→            )}
+   675→
+   676→            {/* center play button */}
+   677→            {!resolving && !isBusy && !resolveError && !playing && !srcError ? (
+   678→              <button
+   679→                onClick={() => videoRef.current?.play()}
+   680→                aria-label="Play"
+   681→                className="absolute inset-0 m-auto h-20 w-20 rounded-full glass gold-border-glow flex items-center justify-center text-[#e6c26e] hover:scale-105 transition-transform"
+   682→              >
+   683→                <Play className="h-9 w-9 fill-current" />
+   684→              </button>
+   685→            ) : null}
+   686→
+   687→            {/* native control bar */}
+   688→            {!resolving && !isBusy && !resolveError && !srcError ? (
+   689→              <div
+   690→                className={cn(
+   691→                  "absolute bottom-0 inset-x-0 transition-all duration-300",
+   692→                  showControls
+   693→                    ? "opacity-100 translate-y-0"
+   694→                    : "opacity-0 translate-y-3 pointer-events-none"
+   695→                )}
+   696→              >
+   697→                <div className="mx-3 mb-3 rounded-2xl glass glass-sheen px-4 py-3">
+   698→                  {/* seek bar */}
+   699→                  <div className="relative flex items-center gap-3">
+   700→                    <input
+   701→                      type="range"
+   702→                      className="player-range w-full"
+   703→                      min={0}
+   704→                      max={duration || 0}
+   705→                      step={0.1}
+   706→                      value={current}
+   707→                      aria-label="Seek"
+   708→                      style={{
+   709→                        background: `linear-gradient(to right, #e6c26e 0%, #e6c26e ${
+   710→                          duration ? (current / duration) * 100 : 0
+   711→                        }%, rgba(230,194,110,0.35) ${
+   712→                          duration ? (buffered / duration) * 100 : 0
+   713→                        }%, rgba(255,255,255,0.18) ${
+   714→                          duration ? (buffered / duration) * 100 : 0
+   715→                        }%, rgba(255,255,255,0.18) 100%)`,
+   716→                      }}
+   717→                      onChange={(e) => {
+   718→                        const v = videoRef.current;
+   719→                        if (v) v.currentTime = Number(e.target.value);
+   720→                      }}
+   721→                    />
+   722→                  </div>
+   723→
+   724→                  <div className="flex items-center gap-1.5 sm:gap-2.5 mt-2.5 text-white/90">
+   725→                    <button
+   726→                      onClick={playPrev}
+   727→                      disabled={!hasPrev}
+   728→                      aria-label="Previous lecture"
+   729→                      className="p-2 rounded-full hover:bg-white/10 disabled:opacity-30"
+   730→                    >
+   731→                      <SkipBack className="h-5 w-5" />
+   732→                    </button>
+   733→                    <button
+   734→                      onClick={() => {
+   735→                        const v = videoRef.current;
+   736→                        if (v) {
+   737→                          if (v.paused) v.play().catch(() => undefined);
+   738→                          else v.pause();
+   739→                        }
+   740→                      }}
+   741→                      aria-label={playing ? "Pause" : "Play"}
+   742→                      className="p-2 rounded-full hover:bg-white/10"
+   743→                    >
+   744→                      {playing ? (
+   745→                        <Pause className="h-5 w-5" />
+   746→                      ) : (
+   747→                        <Play className="h-5 w-5 fill-current" />
+   748→                      )}
+   749→                    </button>
+   750→                    <button
+   751→                      onClick={playNext}
+   752→                      disabled={!hasNext}
+   753→                      aria-label="Next lecture"
+   754→                      className="p-2 rounded-full hover:bg-white/10 disabled:opacity-30"
+   755→                    >
+   756→                      <SkipForward className="h-5 w-5" />
+   757→                    </button>
+   758→                    <button
+   759→                      onClick={() => {
+   760→                        const v = videoRef.current;
+   761→                        if (v) v.currentTime = Math.max(0, v.currentTime - 10);
+   762→                      }}
+   763→                      aria-label="Back 10 seconds"
+   764→                      className="p-2 rounded-full hover:bg-white/10"
+   765→                    >
+   766→                      <RotateCcw className="h-5 w-5" />
+   767→                    </button>
+   768→                    <button
+   769→                      onClick={() => {
+   770→                        const v = videoRef.current;
+   771→                        if (v)
+   772→                          v.currentTime = Math.min(
+   773→                            v.currentTime + 10,
+   774→                            v.duration || 0
+   775→                          );
+   776→                      }}
+   777→                      aria-label="Forward 10 seconds"
+   778→                      className="p-2 rounded-full hover:bg-white/10"
+   779→                    >
+   780→                      <RotateCw className="h-5 w-5" />
+   781→                    </button>
+   782→
+   783→                    <div className="flex items-center gap-1.5 group/vol">
+   784→                      <button
+   785→                        onClick={() => {
+   786→                          const v = videoRef.current;
+   787→                          if (v) v.muted = !v.muted;
+   788→                        }}
+   789→                        aria-label={muted ? "Unmute" : "Mute"}
+   790→                        className="p-2 rounded-full hover:bg-white/10"
+   791→                      >
+   792→                        {muted || volume === 0 ? (
+   793→                          <VolumeX className="h-5 w-5" />
+   794→                        ) : (
+   795→                          <Volume2 className="h-5 w-5" />
+   796→                        )}
+   797→                      </button>
+   798→                      <input
+   799→                        type="range"
+   800→                        className="player-range w-0 group-hover/vol:w-16 sm:w-16 transition-all duration-300"
+   801→                        min={0}
+   802→                        max={1}
+   803→                        step={0.05}
+   804→                        value={muted ? 0 : volume}
+   805→                        aria-label="Volume"
+   806→                        onChange={(e) => {
+   807→                          const v = videoRef.current;
+   808→                          if (v) {
+   809→                            v.volume = Number(e.target.value);
+   810→                            v.muted = Number(e.target.value) === 0;
+   811→                          }
+   812→                        }}
+   813→                      />
+   814→                    </div>
+   815→
+   816→                    <span className="text-xs tabular-nums ml-1">
+   817→                      {fmt(current)} / {fmt(duration)}
+   818→                    </span>
+   819→
+   820→                    <div className="flex-1" />
+   821→
+   822→                    {/* switch to source */}
+   823→                    <button
+   824→                      onClick={() => setMode("source")}
+   825→                      aria-label="Switch to source stream"
+   826→                      title="Switch to the Source stream — always plays"
+   827→                      className="p-2 rounded-full hover:bg-[rgba(230,194,110,0.15)] text-[#e6c26e]"
+   828→                    >
+   829→                      <Film className="h-5 w-5" />
+   830→                    </button>
+   831→
+   832→                    {/* settings */}
+   833→                    <div className="relative">
+   834→                      <button
+   835→                        onClick={() => setMenu(menu === null ? "settings" : null)}
+   836→                        aria-label="Settings"
+   837→                        className={cn(
+   838→                          "p-2 rounded-full hover:bg-white/10",
+   839→                          menu ? "text-[#e6c26e]" : ""
+   840→                        )}
+   841→                      >
+   842→                        <Settings className="h-5 w-5" />
+   843→                      </button>
+   844→                      {menu === "settings" ? (
+   845→                        <div className="absolute bottom-12 right-0 rounded-2xl glass glass-sheen p-2 min-w-[160px] text-sm max-h-64 overflow-y-auto">
+   846→                          <p className="px-2 py-1 text-[10px] font-bold tracking-widest text-muted-foreground">
+   847→                            QUALITY
+   848→                          </p>
+   849→                          {mp4Qualities.length > 0 ? (
+   850→                            mp4Qualities.map((c) => (
+   851→                              <button
+   852→                                key={c.url}
+   853→                                onClick={() => pickQuality(c)}
+   854→                                className={cn(
+   855→                                  "w-full text-left px-3 py-1.5 rounded-lg hover:bg-white/10",
+   856→                                  activeLabel === c.label &&
+   857→                                    "text-[#e6c26e] font-bold"
+   858→                                )}
+   859→                              >
+   860→                                {c.label}
+   861→                              </button>
+   862→                            ))
+   863→                          ) : (
+   864→                            <p className="px-3 py-1.5 text-xs text-muted-foreground">
+   865→                              Auto ({activeLabel})
+   866→                            </p>
+   867→                          )}
+   868→                          <p className="px-2 pt-1 text-[10px] font-bold tracking-widest text-muted-foreground">
+   869→                            SPEED
+   870→                          </p>
+   871→                          <div className="grid grid-cols-3 gap-1 px-1 pb-1">
+   872→                            {SPEEDS.map((s) => (
+   873→                              <button
+   874→                                key={s}
+   875→                                onClick={() => {
+   876→                                  setSpeed(s);
+   877→                                  if (videoRef.current)
+   878→                                    videoRef.current.playbackRate = s;
+   879→                                }}
+   880→                                className={cn(
+   881→                                  "px-2 py-1 rounded-lg text-xs hover:bg-white/10",
+   882→                                  speed === s &&
+   883→                                    "text-[#e6c26e] font-bold bg-white/5"
+   884→                                )}
+   885→                              >
+   886→                                {s}x
+   887→                              </button>
+   888→                            ))}
+   889→                          </div>
+   890→                        </div>
+   891→                      ) : null}
+   892→                    </div>
+   893→
+   894→                    <button
+   895→                      onClick={() => {
+   896→                        const v = videoRef.current as
+   897→                          | (HTMLVideoElement & {
+   898→                              requestPictureInPicture?: () => Promise<unknown>;
+   899→                            })
+   900→                          | null;
+   901→                        v?.requestPictureInPicture?.().catch(() => undefined);
+   902→                      }}
+   903→                      aria-label="Picture in picture"
+   904→                      className="p-2 rounded-full hover:bg-white/10 hidden sm:block"
+   905→                    >
+   906→                      <PictureInPicture2 className="h-5 w-5" />
+   907→                    </button>
+   908→                    <button
+   909→                      onClick={toggleFullscreen}
+   910→                      aria-label="Fullscreen"
+   911→                      className="p-2 rounded-full hover:bg-white/10"
+   912→                    >
+   913→                      {fullscreen ? (
+   914→                        <Minimize className="h-5 w-5" />
+   915→                      ) : (
+   916→                        <Maximize className="h-5 w-5" />
+   917→                      )}
+   918→                    </button>
+   919→                  </div>
+   920→                </div>
+   921→              </div>
+   922→            ) : null}
+   923→          </>
+   924→        )}
+   925→
+   926→        {/* floating prev / next (both modes) */}
+   927→        {mode === "source" && (hasPrev || hasNext) ? (
+   928→          <>
+   929→            <button
+   930→              onClick={playPrev}
+   931→              disabled={!hasPrev}
+   932→              aria-label="Previous lecture"
+   933→              className="hidden sm:flex absolute left-3 top-1/2 -translate-y-1/2 z-10 h-11 w-11 items-center justify-center rounded-full glass gold-border-glow text-[#e6c26e] hover:scale-105 hover:text-[#f2d98a] transition-all disabled:opacity-25 disabled:pointer-events-none"
+   934→            >
+   935→              <SkipBack className="h-5 w-5 fill-current" />
+   936→            </button>
+   937→            <button
+   938→              onClick={playNext}
+   939→              disabled={!hasNext}
+   940→              aria-label="Next lecture"
+   941→              className="hidden sm:flex absolute right-3 top-1/2 -translate-y-1/2 z-10 h-11 w-11 items-center justify-center rounded-full glass gold-border-glow text-[#e6c26e] hover:scale-105 hover:text-[#f2d98a] transition-all disabled:opacity-25 disabled:pointer-events-none"
+   942→            >
+   943→              <SkipForward className="h-5 w-5 fill-current" />
+   944→            </button>
+   945→          </>
+   946→        ) : null}
+   947→      </div>
+   948→
+   949→      {/* ================= golden dock (source mode) ================= */}
+   950→      {mode === "source" ? (
+   951→        <div className="shrink-0 relative z-20 border-t border-[rgba(230,194,110,0.16)] bg-black/85">
+   952→          <div className="absolute top-0 inset-x-0 h-px bg-gradient-to-r from-transparent via-[rgba(230,194,110,0.55)] to-transparent" />
+   953→          <div className="flex items-center gap-2 px-3 sm:px-5 py-2.5 overflow-x-auto">
+   954→            <GoldIcon
+   955→              icon={SkipBack}
+   956→              label="Previous lecture"
+   957→              onClick={playPrev}
+   958→              disabled={!hasPrev}
+   959→            />
+   960→            <GoldIcon
+   961→              icon={SkipForward}
+   962→              label="Next lecture"
+   963→              onClick={playNext}
+   964→              disabled={!hasNext}
+   965→            />
+   966→            <div className="h-6 w-px bg-[rgba(230,194,110,0.2)] mx-1 shrink-0" />
+   967→            <GoldIcon
+   968→              icon={RefreshCw}
+   969→              label="Reload stream"
+   970→              onClick={() => setIframeKey((k) => k + 1)}
+   971→            />
+   972→            <GoldIcon
+   973→              icon={MonitorPlay}
+   974→              label="Try the native player"
+   975→              onClick={() => setMode("native")}
+   976→            />
+   977→            <GoldIcon
+   978→              icon={RectangleHorizontal}
+   979→              label={cinema ? "Exit cinema frame" : "Cinema frame"}
+   980→              onClick={() => setCinema((c) => !c)}
+   981→              active={cinema}
+   982→            />
+   983→            <div className="flex-1 min-w-2" />
+   984→            <GoldIcon
+   985→              icon={ExternalLink}
+   986→              label="Open source page in new tab"
+   987→              onClick={() => window.open(sourceUrl, "_blank", "noopener")}
+   988→            />
+   989→            <GoldIcon
+   990→              icon={Maximize}
+   991→              label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+   992→              onClick={toggleFullscreen}
+   993→            />
+   994→            <span className="hidden md:block text-[10px] tracking-[0.18em] uppercase text-[#e6c26e]/50 font-bold pl-1 shrink-0">
+   995→              Study Bison Golden Theater
+   996→            </span>
+   997→          </div>
+   998→        </div>
+   999→      ) : null}
+  1000→    </div>
+  1001→  );
+  1002→}
+  1003→

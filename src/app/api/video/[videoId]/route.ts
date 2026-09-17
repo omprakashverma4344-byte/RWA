@@ -31,6 +31,7 @@ export async function GET(
       videoUrl: resolved.videoUrl,
       hlsUrl: resolved.hlsUrl,
       qualities,
+      embedUrl: resolved.embedUrl ?? null,
     });
   } catch (e) {
     if (e instanceof UpstreamBusyError)

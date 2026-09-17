@@ -251,18 +251,31 @@ export async function resolveVideo(contentId: string, courseId: string, force = 
     const url = row?.fileLink ? decryptLink(row.fileLink) : "";
     if (!url) {
       if (res.status === 429) throw new UpstreamBusyError();
-      return null;
+      const saved0 = await db.mediaResolve.upsert({
+        where: { contentId },
+        update: { embedUrl: row?.embedUrl ?? null, updatedAt: new Date() },
+        create: { contentId, courseId, embedUrl: row?.embedUrl ?? null },
+      });
+      return saved0;
     }
     const saved = await db.mediaResolve.upsert({
       where: { contentId },
-      update: { videoUrl: url, updatedAt: new Date() },
-      create: { contentId, courseId, videoUrl: url },
+      update: { videoUrl: url, embedUrl: row?.embedUrl ?? null, updatedAt: new Date() },
+      create: { contentId, courseId, videoUrl: url, embedUrl: row?.embedUrl ?? null },
     });
     return saved;
   }
 
   const videoUrl = decryptLink(data.file_link) || undefined;
-  const embedUrl = (data.embed_url as string) || undefined;
+
+  // YouTube-only lectures carry an id + ytFlag instead of a file link; the
+  // source platform feeds them to its player as a youtube.com/watch url.
+  const ytFlag = String((data as Record<string, unknown>).ytFlag ?? (data as Record<string, unknown>).ytFlagWeb ?? "0");
+  const ytId = String((data as Record<string, unknown>).video_id || (data as Record<string, unknown>).youtube_id || (data as Record<string, unknown>).yt_id || "");
+  const embedUrl =
+    ((data.embed_url as string) ||
+      (ytId && ytFlag === "1" ? `https://www.youtube.com/watch?v=${ytId}` : "") ||
+      undefined) as string | undefined;
 
   const qualities: { quality: string; url: string }[] = [];
   if (Array.isArray(data.encrypted_links)) {
@@ -288,6 +301,7 @@ export async function resolveVideo(contentId: string, courseId: string, force = 
       videoUrl: videoUrl ?? null,
       hlsUrl: hlsUrl ?? null,
       qualities: qualities.length ? JSON.stringify(qualities) : null,
+      embedUrl: embedUrl ?? null,
       updatedAt: new Date(),
     },
     create: {
@@ -296,6 +310,7 @@ export async function resolveVideo(contentId: string, courseId: string, force = 
       videoUrl: videoUrl ?? null,
       hlsUrl: hlsUrl ?? null,
       qualities: qualities.length ? JSON.stringify(qualities) : null,
+      embedUrl: embedUrl ?? null,
     },
   });
   return saved;

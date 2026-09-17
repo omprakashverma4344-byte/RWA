@@ -3,10 +3,13 @@
 /**
  * Golden Theater — Study Bison's premium lecture player.
  *
- * SOURCE mode (default): embeds the original rwaweb.vercel.app topic page in a
- *   golden-framed stage. Playback runs on the origin's own secure stream, so
- *   fresh links are resolved by the source itself at play time — lectures keep
- *   working even when the upstream rate-limits our direct resolver.
+ * STREAM mode (default): resolves a FRESH direct stream link (mp4 / HLS / YT)
+ *   through our API, then embeds ONLY the source platform's dedicated player
+ *   page — workers.dev/player?url=<stream>&title=<title> — inside the golden
+ *   stage. This is exactly how the original site plays lectures (its own modal
+ *   is an iframe of that player page). No site chrome, no login, no lists —
+ *   just the player. Links are ephemeral, so the gold Reload button (and the
+ *   busy-retry loop) always force-resolves a fresh link at play time.
  *
  * NATIVE mode: Study Bison's own golden video player (direct mp4 / HLS with
  *   adaptive-quality fallback) for when a fresh direct stream is available.
@@ -29,7 +32,6 @@ import {
   Settings,
   PictureInPicture2,
   Loader2,
-  PlayCircle,
   SkipBack,
   SkipForward,
   RefreshCw,
@@ -37,16 +39,10 @@ import {
   Film,
   ExternalLink,
   RectangleHorizontal,
-  HelpCircle,
-  LogIn,
-  MousePointerClick,
-  ListVideo,
-  BellOff,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-const GUIDE_KEY = "sb_theater_guide_v1";
-const SOURCE_ORIGIN = "https://rwaweb.vercel.app";
+const PLAYER_ORIGIN = "https://sanjayxrwa2.sanjaykagra2003.workers.dev";
 
 function fmt(t: number): string {
   if (!Number.isFinite(t)) return "0:00";
@@ -73,7 +69,6 @@ export function VideoPlayerModal({
   const cinema = useStore((s) => s.playerCinema);
   const setCinema = useStore((s) => s.setPlayerCinema);
   const [fullscreen, setFullscreen] = useState(false);
-  const [guideOpen, setGuideOpen] = useState(false);
   const playlist = useStore((s) => s.playerPlaylist);
   const playNext = useStore((s) => s.playNextLecture);
   const playPrev = useStore((s) => s.playPrevLecture);
@@ -83,24 +78,6 @@ export function VideoPlayerModal({
   const hasNext = pIdx >= 0 && pIdx < playlist.length - 1;
 
   const shellRef = useRef<HTMLDivElement>(null);
-
-  // guide: show once per browser until dismissed
-  useEffect(() => {
-    try {
-      if (window.localStorage.getItem(GUIDE_KEY) !== "1") setGuideOpen(true);
-    } catch {
-      setGuideOpen(true);
-    }
-  }, []);
-
-  const dismissGuide = () => {
-    setGuideOpen(false);
-    try {
-      window.localStorage.setItem(GUIDE_KEY, "1");
-    } catch {
-      /* private mode */
-    }
-  };
 
   // ============ fullscreen ============
   const toggleFullscreen = useCallback(() => {
@@ -117,15 +94,96 @@ export function VideoPlayerModal({
     return () => document.removeEventListener("fullscreenchange", onFs);
   }, []);
 
-  // ============ SOURCE (iframe) state ============
+  // ============ SECURE STREAM (iframe of the dedicated player page) ============
+  const [streamSrc, setStreamSrc] = useState<string | null>(null);
+  const [streamState, setStreamState] = useState<
+    "resolving" | "ready" | "error"
+  >("resolving");
+  const [streamAttempts, setStreamAttempts] = useState(0);
+  const [streamError, setStreamError] = useState<string | null>(null);
   const [iframeKey, setIframeKey] = useState(0);
   const [iframeLoading, setIframeLoading] = useState(true);
 
   useEffect(() => {
     setIframeLoading(true);
-  }, [iframeKey, mode]);
+  }, [iframeKey, mode, streamSrc]);
 
-  const sourceUrl = `${SOURCE_ORIGIN}/batch/${content.courseId}/subject/${content.subjectId}/topic/${content.topicId}`;
+  /**
+   * Resolve a fresh stream link and point the iframe at the dedicated player
+   * page (video player ONLY — no site chrome). Retries through busy windows
+   * just like the original site's "Servers are busy, retrying…".
+   */
+  const loadStream = useCallback(
+    (round: number, force = false) => {
+      setStreamState("resolving");
+      setStreamError(null);
+      setStreamAttempts(round);
+      api
+        .resolveVideo(
+          content.courseId,
+          content.contentId,
+          force ? "&force=1" : ""
+        )
+        .then((r: VideoResolve | null) => {
+          const raw = r?.videoUrl || r?.hlsUrl || null;
+          const embed = r?.embedUrl || content.embedUrl || null;
+          if (raw) {
+            setStreamSrc(
+              `${PLAYER_ORIGIN}/player?url=${encodeURIComponent(
+                raw
+              )}&title=${encodeURIComponent(content.title)}`
+            );
+            setStreamState("ready");
+          } else if (embed) {
+            setStreamSrc(embed);
+            setStreamState("ready");
+          } else if (round < 30) {
+            window.setTimeout(
+              () => loadStreamRef.current(round + 1, force),
+              10000
+            );
+          } else {
+            setStreamError("No playable stream found for this lecture.");
+            setStreamState("error");
+          }
+        })
+        .catch((e) => {
+          const msg = String((e as Error).message || e);
+          if (msg.includes("busy") && round < 30) {
+            setStreamAttempts(round + 1);
+            window.setTimeout(
+              () => loadStreamRef.current(round + 1, force),
+              10000
+            );
+          } else {
+            setStreamError(msg);
+            setStreamState("error");
+          }
+        });
+    },
+    [content.courseId, content.contentId, content.title, content.embedUrl]
+  );
+
+  const loadStreamRef = useRef<(round: number, force?: boolean) => void>(
+    () => undefined
+  );
+  useEffect(() => {
+    loadStreamRef.current = loadStream;
+  });
+
+  // kick the stream resolve the first time we are in stream (source) mode
+  const streamKickRef = useRef(false);
+  useEffect(() => {
+    if (mode !== "source" || streamKickRef.current) return;
+    streamKickRef.current = true;
+    loadStream(0);
+  }, [mode, loadStream]);
+
+  /** Gold Reload: force a FRESH link (old ephemeral links expire) + remount iframe */
+  const reloadStream = useCallback(() => {
+    setIframeKey((k) => k + 1);
+    loadStreamRef.current(0, true);
+  }, []);
 
   // ============ NATIVE pipeline (kept from v1, runs only in native mode) ============
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -209,7 +267,7 @@ export function VideoPlayerModal({
         resolveFreshRef.current(resolveRoundRef.current);
       } else {
         setSrcError(
-          "This lecture's direct stream links have expired and the servers are busy refreshing them. Switch back to the Source stream — it always plays."
+          "This lecture's direct stream links have expired and the servers are busy refreshing them. Switch back to the Secure stream — it always plays."
         );
       }
       return;
@@ -409,7 +467,7 @@ export function VideoPlayerModal({
             {mode === "source" ? (
               <>
                 <span className="h-1.5 w-1.5 rounded-full bg-[#e6c26e] animate-pulse" />
-                Source stream
+                Secure stream
               </>
             ) : (
               <>
@@ -419,14 +477,6 @@ export function VideoPlayerModal({
             )}
           </div>
 
-          <button
-            onClick={() => setGuideOpen(true)}
-            aria-label="How to use the source stream"
-            title="How to use"
-            className="h-9 w-9 rounded-xl flex items-center justify-center text-[#e6c26e] border border-[rgba(230,194,110,0.22)] bg-white/5 hover:bg-[rgba(230,194,110,0.16)] transition-colors"
-          >
-            <HelpCircle className="h-[18px] w-[18px]" />
-          </button>
           <button
             onClick={() => {
               if (document.fullscreenElement) {
@@ -457,7 +507,7 @@ export function VideoPlayerModal({
           <div className="absolute -bottom-24 right-1/5 h-72 w-72 rounded-full bg-[rgba(184,134,11,0.09)] blur-3xl" />
         </div>
 
-        {/* ---------- SOURCE MODE ---------- */}
+        {/* ---------- SECURE STREAM MODE (video player only) ---------- */}
         {mode === "source" ? (
           <div
             className={cn(
@@ -467,96 +517,79 @@ export function VideoPlayerModal({
                 : "w-full h-full"
             )}
           >
-            <iframe
-              key={iframeKey}
-              src={sourceUrl}
-              title={`Lecture stream: ${content.title}`}
-              className="absolute inset-0 w-full h-full border-0 bg-black"
-              allow="autoplay; fullscreen; encrypted-media; picture-in-picture; clipboard-write"
-              allowFullScreen
-              onLoad={() => setIframeLoading(false)}
-            />
+            {streamState === "ready" && streamSrc ? (
+              <iframe
+                key={iframeKey}
+                src={streamSrc}
+                title={`Lecture player: ${content.title}`}
+                className="absolute inset-0 w-full h-full border-0 bg-black"
+                referrerPolicy="no-referrer"
+                allow="autoplay; fullscreen; encrypted-media; picture-in-picture; clipboard-write"
+                allowFullScreen
+                onLoad={() => setIframeLoading(false)}
+              />
+            ) : null}
 
-            {/* connecting shimmer */}
-            {iframeLoading ? (
+            {/* resolving / busy overlay */}
+            {streamState === "resolving" ? (
+              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black px-6 text-center">
+                <div className="relative">
+                  <div className="absolute -inset-6 rounded-full bg-[rgba(230,194,110,0.14)] blur-2xl" />
+                  <Loader2 className="relative h-12 w-12 text-[#e6c26e] animate-spin" />
+                </div>
+                <p className="text-sm font-semibold gold-text tracking-wide">
+                  {streamAttempts > 0
+                    ? `Servers are busy, retrying… (attempt ${streamAttempts + 1})`
+                    : "Preparing your lecture…"}
+                </p>
+                <p className="text-xs text-white/40">
+                  Resolving a fresh secure stream link
+                </p>
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                  <button
+                    onClick={() => loadStreamRef.current(0, true)}
+                    className="rounded-xl px-4 py-2 text-sm font-bold border border-[rgba(230,194,110,0.4)] text-[#e6c26e] hover:bg-[rgba(230,194,110,0.12)] transition-colors"
+                  >
+                    Retry now
+                  </button>
+                  <button
+                    onClick={() => setMode("native")}
+                    className="text-xs text-[#e6c26e] underline underline-offset-4 hover:text-[#f2d98a]"
+                  >
+                    Try the native player instead
+                  </button>
+                </div>
+              </div>
+            ) : streamState === "error" ? (
+              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black px-6 text-center">
+                <p className="text-white/80 text-sm max-w-md">{streamError}</p>
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                  <button
+                    onClick={() => loadStreamRef.current(0, true)}
+                    className="btn-gold rounded-xl px-4 py-2 text-sm font-bold"
+                  >
+                    Try again
+                  </button>
+                  <button
+                    onClick={() => setMode("native")}
+                    className="rounded-xl px-4 py-2 text-sm font-bold border border-[rgba(230,194,110,0.4)] text-[#e6c26e] hover:bg-[rgba(230,194,110,0.12)] transition-colors"
+                  >
+                    Use Native player
+                  </button>
+                </div>
+              </div>
+            ) : iframeLoading ? (
               <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black">
                 <div className="relative">
                   <div className="absolute -inset-6 rounded-full bg-[rgba(230,194,110,0.14)] blur-2xl" />
                   <Loader2 className="relative h-12 w-12 text-[#e6c26e] animate-spin" />
                 </div>
                 <p className="text-sm font-semibold gold-text tracking-wide">
-                  Connecting to the source stream…
+                  Connecting to the secure player…
                 </p>
                 <p className="text-xs text-white/40">
-                  Secure lecture link is being prepared
+                  Golden Theater · streaming from the source
                 </p>
-              </div>
-            ) : null}
-
-            {/* first-run golden guide */}
-            {guideOpen ? (
-              <div className="absolute inset-0 z-20 flex items-center justify-center p-4 bg-black/72 backdrop-blur-[6px]">
-                <div className="glass glass-sheen gold-border-glow rounded-3xl max-w-md w-full p-6 relative overflow-hidden">
-                  <div className="flex items-center gap-3 mb-4">
-                    <div className="h-10 w-10 rounded-xl btn-gold flex items-center justify-center shrink-0">
-                      <Film className="h-5 w-5 text-[#241a04]" />
-                    </div>
-                    <div>
-                      <p className="font-extrabold gold-text leading-tight">
-                        Golden Theater · Source Stream
-                      </p>
-                      <p className="text-[11px] text-white/50">
-                        Lectures play on the original secure stream
-                      </p>
-                    </div>
-                  </div>
-
-                  <ol className="space-y-3 text-sm text-white/85">
-                    <li className="flex items-start gap-3">
-                      <span className="h-6 w-6 shrink-0 rounded-lg btn-gold text-xs font-extrabold flex items-center justify-center">1</span>
-                      <p className="flex items-center gap-2 flex-wrap">
-                        <LogIn className="h-4 w-4 text-[#e6c26e] shrink-0" />
-                        Tap <b className="text-[#f2d98a]">“Skip Login (Guest Mode)”</b> inside the frame — first time only.
-                      </p>
-                    </li>
-                    <li className="flex items-start gap-3">
-                      <span className="h-6 w-6 shrink-0 rounded-lg btn-gold text-xs font-extrabold flex items-center justify-center">2</span>
-                      <p className="flex items-center gap-2 flex-wrap">
-                        <BellOff className="h-4 w-4 text-[#e6c26e] shrink-0" />
-                        If a channel popup appears, tap <b className="text-[#f2d98a]">“Maybe later”</b>.
-                      </p>
-                    </li>
-                    <li className="flex items-start gap-3">
-                      <span className="h-6 w-6 shrink-0 rounded-lg btn-gold text-xs font-extrabold flex items-center justify-center">3</span>
-                      <p className="flex items-center gap-2 flex-wrap">
-                        <RefreshCw className="h-4 w-4 text-[#e6c26e] shrink-0" />
-                        Tap the gold <b className="text-[#f2d98a]">↻ Reload</b> button (bottom bar) to return to this lecture.
-                      </p>
-                    </li>
-                    <li className="flex items-start gap-3">
-                      <span className="h-6 w-6 shrink-0 rounded-lg btn-gold text-xs font-extrabold flex items-center justify-center">4</span>
-                      <p className="flex items-center gap-2 flex-wrap">
-                        <MousePointerClick className="h-4 w-4 text-[#e6c26e] shrink-0" />
-                        Tap <b className="text-[#f2d98a]">{content.title.length > 42 ? "your lecture" : content.title}</b>{" "}
-                        <PlayCircle className="h-4 w-4 text-[#e6c26e]" /> in the Videos list — it streams instantly.
-                      </p>
-                    </li>
-                  </ol>
-
-                  <p className="mt-4 text-[11px] leading-relaxed text-white/45 flex items-start gap-2">
-                    <ListVideo className="h-4 w-4 text-[#e6c26e]/70 shrink-0 mt-px" />
-                    Stream links refresh automatically at play time, so lectures keep working even when direct servers are busy.
-                  </p>
-
-                  <div className="mt-5 flex items-center gap-2">
-                    <button
-                      onClick={dismissGuide}
-                      className="btn-gold rounded-xl px-4 py-2.5 text-sm font-extrabold flex-1"
-                    >
-                      Got it — let&apos;s watch
-                    </button>
-                  </div>
-                </div>
               </div>
             ) : null}
           </div>
@@ -575,7 +608,7 @@ export function VideoPlayerModal({
                   onClick={() => setMode("source")}
                   className="text-xs text-[#e6c26e] underline underline-offset-4 hover:text-[#f2d98a]"
                 >
-                  Play via Source stream instead — always works
+                  Play via Secure stream instead — always works
                 </button>
               </div>
             ) : resolveError ? (
@@ -597,7 +630,7 @@ export function VideoPlayerModal({
                     onClick={() => setMode("source")}
                     className="rounded-xl px-4 py-2 text-sm font-bold border border-[rgba(230,194,110,0.4)] text-[#e6c26e] hover:bg-[rgba(230,194,110,0.12)]"
                   >
-                    Use Source stream
+                    Use Secure stream
                   </button>
                 </div>
               </div>
@@ -618,7 +651,7 @@ export function VideoPlayerModal({
                     onClick={() => setMode("source")}
                     className="rounded-xl px-4 py-2 text-sm font-bold border border-[rgba(230,194,110,0.4)] text-[#e6c26e] hover:bg-[rgba(230,194,110,0.12)]"
                   >
-                    Use Source stream
+                    Use Secure stream
                   </button>
                 </div>
               </div>
@@ -819,11 +852,11 @@ export function VideoPlayerModal({
 
                     <div className="flex-1" />
 
-                    {/* switch to source */}
+                    {/* switch to secure stream */}
                     <button
                       onClick={() => setMode("source")}
-                      aria-label="Switch to source stream"
-                      title="Switch to the Source stream — always plays"
+                      aria-label="Switch to secure stream"
+                      title="Switch to the Secure stream — always plays"
                       className="p-2 rounded-full hover:bg-[rgba(230,194,110,0.15)] text-[#e6c26e]"
                     >
                       <Film className="h-5 w-5" />
@@ -966,8 +999,8 @@ export function VideoPlayerModal({
             <div className="h-6 w-px bg-[rgba(230,194,110,0.2)] mx-1 shrink-0" />
             <GoldIcon
               icon={RefreshCw}
-              label="Reload stream"
-              onClick={() => setIframeKey((k) => k + 1)}
+              label="Reload with a fresh secure link"
+              onClick={reloadStream}
             />
             <GoldIcon
               icon={MonitorPlay}
@@ -983,8 +1016,11 @@ export function VideoPlayerModal({
             <div className="flex-1 min-w-2" />
             <GoldIcon
               icon={ExternalLink}
-              label="Open source page in new tab"
-              onClick={() => window.open(sourceUrl, "_blank", "noopener")}
+              label="Open player in new tab"
+              disabled={!streamSrc}
+              onClick={() =>
+                streamSrc ? window.open(streamSrc, "_blank", "noopener") : undefined
+              }
             />
             <GoldIcon
               icon={Maximize}

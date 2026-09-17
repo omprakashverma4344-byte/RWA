@@ -1,0 +1,113 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A course/batch scraped from the upstream API (batch.json)
+model Batch {
+  batchId      String    @id // upstream batch_id
+  batchName    String
+  thumbUrl     String?
+  price        String    @default("0")
+  startDate    String?
+  endDate      String?
+  subjectCount Int       @default(0)
+  videoCount   Int       @default(0)
+  pdfCount     Int       @default(0)
+  scrapedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  subjects Subject[]
+  contents Content[]
+}
+
+model Subject {
+  id          String    @id // `${courseId}:${subjectId}`
+  subjectId   String
+  courseId    String
+  subjectName String
+  subjectLogo String?
+  isPaid      String    @default("1")
+  sortParam   String    @default("0")
+  scrapedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  batch   Batch   @relation(fields: [courseId], references: [batchId])
+  topics  Topic[]
+
+  @@index([courseId])
+}
+
+model Topic {
+  id        String    @id // `${courseId}:${subjectId}:${topicId}`
+  topicId   String
+  courseId  String
+  subjectId String
+  subjectRefId String // equals Subject.id
+  topicName String
+  topicLogo String?
+  sortParam String    @default("0")
+  scrapedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  subject  Subject   @relation(fields: [subjectRefId], references: [id])
+  contents Content[]
+
+  @@index([courseId, subjectId])
+  @@index([subjectRefId])
+}
+
+model Content {
+  id           String    @id // `${courseId}:${contentId}`
+  contentId    String
+  courseId     String
+  subjectId    String
+  topicId      String
+  topicRefId   String    @default("") // equals Topic.id
+  title        String
+  materialType String    @default("VIDEO") // VIDEO | PDF | OTHER
+  thumbnail    String?
+  fileLink     String? // encrypted video link from list API
+  pdfLink      String? // encrypted pdf link
+  pdfLink2     String? // encrypted pdf link 2
+  embedUrl     String?
+  dateAndTime  String?
+  strtotime    String?
+  duration     String?
+  liveStatus   String?
+  isEncrypted  Boolean   @default(true)
+  extraJson    String? // raw JSON for download_links etc
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  batch Batch @relation(fields: [courseId], references: [batchId])
+  topic Topic @relation(fields: [topicRefId], references: [id])
+
+  @@index([courseId, subjectId, topicId])
+  @@index([topicRefId])
+}
+
+// Generic key/value cache mirroring the upstream shared_cache behaviour
+model ApiCache {
+  key       String   @id
+  value     String // raw JSON response
+  updatedAt DateTime @updatedAt
+}
+
+// Resolved playable media (video url decrypt cache)
+model MediaResolve {
+  contentId String    @id
+  courseId   String
+  videoUrl  String?
+  hlsUrl    String?
+  qualities String? // JSON [{quality, url}]
+  pdfUrl    String?
+  updatedAt DateTime  @updatedAt
+}

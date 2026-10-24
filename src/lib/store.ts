@@ -184,7 +184,7 @@ export const useStore = create<StudyBisonState>()(
       setFilter: (v) => set({ filter: v }),
     }),
     {
-      name: "study-bison-storage",
+      name: "study-premium-storage",
       partialize: (s) => ({
         favorites: s.favorites,
         recents: s.recents,

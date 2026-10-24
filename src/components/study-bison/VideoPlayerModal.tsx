@@ -1028,7 +1028,7 @@ export function VideoPlayerModal({
               onClick={toggleFullscreen}
             />
             <span className="hidden md:block text-[10px] tracking-[0.18em] uppercase text-[#e6c26e]/50 font-bold pl-1 shrink-0">
-              Study Bison Golden Theater
+              STUDY PREMIUM Golden Theater
             </span>
           </div>
         </div>

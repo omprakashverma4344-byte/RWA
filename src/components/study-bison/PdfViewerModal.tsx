@@ -60,7 +60,7 @@ export function PdfViewerModal({
         </a>
         <div className="flex-1" />
         <span className="text-[11px] text-muted-foreground hidden sm:block">
-          Study Bison Notes
+          STUDY PREMIUM Notes
         </span>
       </div>
 

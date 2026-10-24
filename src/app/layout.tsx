@@ -14,11 +14,11 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Study Bison — Premium Learning Hub",
+  title: "STUDY PREMIUM — Premium Learning Hub",
   description:
-    "Study Bison: premium batches, lectures, notes and PDFs for competitive exams. Dark & golden learning experience.",
+    "STUDY PREMIUM: premium batches, lectures, notes and PDFs for competitive exams. Dark & golden learning experience.",
   keywords: [
-    "Study Bison",
+    "STUDY PREMIUM",
     "batches",
     "lectures",
     "notes",
@@ -26,7 +26,7 @@ export const metadata: Metadata = {
     "competitive exams",
     "learning",
   ],
-  authors: [{ name: "Study Bison" }],
+  authors: [{ name: "STUDY PREMIUM" }],
   icons: {
     icon: [
       { url: "/branding/favicon-32.png", sizes: "32x32", type: "image/png" },
@@ -36,14 +36,14 @@ export const metadata: Metadata = {
     apple: "/branding/apple-touch-icon.png",
   },
   openGraph: {
-    title: "Study Bison — Premium Learning Hub",
+    title: "STUDY PREMIUM — Premium Learning Hub",
     description: "Premium batches, lectures, notes and PDFs — all in one place.",
-    siteName: "Study Bison",
+    siteName: "STUDY PREMIUM",
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Study Bison — Premium Learning Hub",
+    title: "STUDY PREMIUM — Premium Learning Hub",
     description: "Premium batches, lectures, notes and PDFs — all in one place.",
   },
 };

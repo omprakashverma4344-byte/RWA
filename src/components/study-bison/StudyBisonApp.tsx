@@ -11,7 +11,7 @@ import { SimpleListView } from "./SimpleListView";
 import { VideoPlayerModal } from "./VideoPlayerModal";
 import { PdfViewerModal } from "./PdfViewerModal";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
-import { Moon, Sun } from "lucide-react";
+import { Moon, Sun, Send } from "lucide-react";
 
 function useCourseCount() {
   const [count, setCount] = useState<number | null>(null);
@@ -74,13 +74,13 @@ export function StudyBisonApp() {
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src="/branding/logo.png"
-                alt="Study Bison logo"
+                alt="STUDY PREMIUM logo"
                 className="h-full w-full object-cover group-hover:scale-105 transition-transform duration-300"
               />
             </div>
             <div className="text-left">
               <p className="font-extrabold text-base sm:text-lg leading-tight gold-text">
-                Study Bison
+                STUDY PREMIUM
               </p>
               <p className="text-[11px] text-muted-foreground leading-tight">
                 {courseCount ? `${courseCount} courses` : "Loading courses…"}
@@ -166,10 +166,21 @@ export function StudyBisonApp() {
               <img src="/branding/logo.png" alt="" className="h-full w-full object-cover" />
             </span>
             <span>
-              © {new Date().getFullYear()} <span className="gold-text font-bold">Study Bison</span> — Made with 🦬 for learners
+              © {new Date().getFullYear()} <span className="gold-text font-bold">STUDY PREMIUM</span> — Made with 🦬 for learners
             </span>
           </p>
-          <p>Premium lectures · Notes · PDFs — all in one place</p>
+          <div className="flex items-center gap-3">
+            <a
+              href="https://t.me/+gbzcsyH9ApsxNzk1"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg glass glass-hover text-[#e6c26e] hover:text-[#f2d98a] transition-colors text-xs font-medium"
+            >
+              <Send className="h-3.5 w-3.5" />
+              Telegram
+            </a>
+            <span>Premium lectures · Notes · PDFs — all in one place</span>
+          </div>
         </div>
       </footer>
 

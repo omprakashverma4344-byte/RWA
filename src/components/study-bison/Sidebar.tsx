@@ -12,6 +12,7 @@ import {
   ClipboardList,
   X,
   Database,
+  Send,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
@@ -92,13 +93,13 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src="/branding/logo.png"
-            alt="Study Bison logo"
+            alt="STUDY PREMIUM logo"
             className="h-full w-full object-cover"
           />
         </div>
         <div className="min-w-0 flex-1">
           <p className="font-extrabold text-lg leading-tight gold-text">
-            Study Bison
+            STUDY PREMIUM
           </p>
           <p className="text-[11px] text-muted-foreground">
             Made with 🦬 for learners
@@ -148,9 +149,18 @@ export function Sidebar({ onClose }: { onClose?: () => void }) {
         })}
       </nav>
 
-      <div className="p-4 border-t border-sidebar-border/60 text-[11px] text-muted-foreground/70 safe-bottom space-y-1">
+      <div className="p-4 border-t border-sidebar-border/60 text-[11px] text-muted-foreground/70 safe-bottom space-y-2">
+        <a
+          href="https://t.me/+gbzcsyH9ApsxNzk1"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-2 px-3 py-2 rounded-xl glass glass-hover text-[#e6c26e] hover:text-[#f2d98a] transition-colors text-xs font-medium w-full"
+        >
+          <Send className="h-4 w-4" />
+          Join Telegram
+        </a>
         <LibraryStatus />
-        <p>© {new Date().getFullYear()} Study Bison</p>
+        <p>© {new Date().getFullYear()} STUDY PREMIUM</p>
       </div>
     </div>
   );
